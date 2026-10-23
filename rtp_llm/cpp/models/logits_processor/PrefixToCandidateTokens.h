@@ -9,6 +9,7 @@
 #include <limits>
 #include <memory>
 #include <mutex>
+#include <stdexcept>
 #include <map>
 #include <unordered_map>
 #include <unordered_set>
@@ -26,12 +27,14 @@ public:
     int32_t                                     start_token_id;
     int32_t                                     end_token_id;
     std::string                                 sep;
+    bool                                        allow_unlisted_tokens = false;
     std::map<std::string, std::vector<int32_t>> prefix_dict;
 
     void Jsonize(autil::legacy::Jsonizable::JsonWrapper& json) override {
         json.Jsonize("start_token_id", start_token_id, 225);
         json.Jsonize("end_token_id", end_token_id, 2);
         json.Jsonize("sep", sep, "_");
+        json.Jsonize("allow_unlisted_tokens", allow_unlisted_tokens, false);
         json.Jsonize("prefix_dict", prefix_dict, prefix_dict);
     }
 };
@@ -48,9 +51,10 @@ public:
         dict_key_(),
         current_array_(),
         depth_(0) {
-        config_.start_token_id = 225;  // default
-        config_.end_token_id   = 2;    // default
-        config_.sep            = "_";  // default
+        config_.start_token_id        = 225;  // default
+        config_.end_token_id          = 2;    // default
+        config_.sep                   = "_";  // default
+        config_.allow_unlisted_tokens = false;
     }
 
     bool Null() {
@@ -62,12 +66,17 @@ public:
         }
         return rejectScalar("null");
     }
-    bool Bool(bool) {
+    bool Bool(bool value) {
         if (skip_depth_ > 0) {
             return true;
         }
         if (depth_ == 0) {
             return typeError("root must be a JSON object");
+        }
+        if (depth_ == 1 && !in_array_ && current_key_ == "allow_unlisted_tokens") {
+            config_.allow_unlisted_tokens = value;
+            current_key_.clear();
+            return true;
         }
         return rejectScalar("bool");
     }
@@ -138,6 +147,9 @@ public:
         }
         if (depth_ == 1) {
             // value of a root-level key
+            if (current_key_ == "allow_unlisted_tokens") {
+                return typeError("allow_unlisted_tokens must be a boolean, got string");
+            }
             if (current_key_ == "sep") {
                 config_.sep = std::string(str, length);
                 current_key_.clear();
@@ -171,6 +183,8 @@ public:
                 in_prefix_dict_ = true;
             } else if (current_key_ == "start_token_id" || current_key_ == "end_token_id") {
                 return typeError("start_token_id/end_token_id must be an integer, got object");
+            } else if (current_key_ == "allow_unlisted_tokens") {
+                return typeError("allow_unlisted_tokens must be a boolean, got object");
             } else if (current_key_ == "sep") {
                 return typeError("sep must be a string, got object");
             } else if (!current_key_.empty()) {
@@ -271,13 +285,18 @@ public:
     }
 
 public:
+    bool skippedCandidate() const {
+        return skipped_candidate_;
+    }
+
     bool schemaError() const {
         return schema_error_;
     }
 
 private:
     static bool isKnownRootKey(const std::string& key) {
-        return key == "start_token_id" || key == "end_token_id" || key == "sep" || key == "prefix_dict";
+        return key == "start_token_id" || key == "end_token_id" || key == "sep" || key == "prefix_dict"
+               || key == "allow_unlisted_tokens";
     }
 
     bool typeError(const std::string& msg) {
@@ -289,15 +308,13 @@ private:
         return false;
     }
 
-    // bool/null/double are never valid values anywhere in tree_decode_config. They are tolerated
+    // Except for the explicit boolean switch, these scalar types are tolerated
     // (and ignored, matching the legacy parser) only as the value of an unknown root-level key.
     bool rejectScalar(const char* json_type) {
         if (in_array_) {
             return typeError(std::string("prefix_dict array element must be an integer, got ") + json_type);
         }
-        if (depth_ == 1
-            && (current_key_ == "start_token_id" || current_key_ == "end_token_id" || current_key_ == "sep"
-                || current_key_ == "prefix_dict")) {
+        if (depth_ == 1 && isKnownRootKey(current_key_)) {
             return typeError("key '" + current_key_ + "' has an unexpected " + json_type + " value");
         }
         if (in_prefix_dict_ && !dict_key_.empty()) {
@@ -318,6 +335,8 @@ private:
                 to_start = true;
             } else if (current_key_ == "end_token_id") {
                 to_end = true;
+            } else if (current_key_ == "allow_unlisted_tokens") {
+                return typeError("allow_unlisted_tokens must be a boolean, got number");
             } else if (current_key_ == "sep") {
                 return typeError("sep must be a string, got number");
             } else if (current_key_ == "prefix_dict") {
@@ -338,6 +357,7 @@ private:
                 // fall back to the default token, which is misleading. Treat it as a schema error.
                 return typeError("start_token_id/end_token_id value out of int32_t range");
             }
+            skipped_candidate_ = true;
             // Candidate token arrays stay lenient: skip out-of-range entries rather than failing.
             RTP_LLM_LOG_WARNING("PrefixToCandidateTokens SAX: integer value %lld overflows int32_t, skipping",
                                 (long long)v);
@@ -355,6 +375,7 @@ private:
             // invalid and would throw at logits time (DFAUtil::getCandidateTokenIds). Skip it here so
             // a bad entry never reaches the runtime, while keeping the rest of the list usable.
             if (value < 0) {
+                skipped_candidate_ = true;
                 RTP_LLM_LOG_WARNING("PrefixToCandidateTokens SAX: negative candidate token id %d skipped", value);
             } else {
                 current_array_.push_back(value);
@@ -363,6 +384,7 @@ private:
         return true;
     }
 
+    bool                                                          skipped_candidate_ = false;
     TreeDecodeConfig&                                             config_;
     std::unordered_map<std::string, std::unordered_set<int32_t>>& prefix_map_;
     bool                                                          in_prefix_dict_;
@@ -402,6 +424,17 @@ public:
         } else {
             return true;
         }
+    }
+
+    bool allowUnlistedTokens() const {
+        return config.allow_unlisted_tokens;
+    }
+    bool isControlledToken(int32_t token) const {
+        return controlled_tokens_.count(token) != 0;
+    }
+    // Like the prefix dictionary, this set is immutable during generation.
+    const std::unordered_set<int32_t>& controlledTokens() const {
+        return controlled_tokens_;
     }
 
     bool initSuccess() {
@@ -446,10 +479,13 @@ private:
         std::lock_guard<std::mutex> lock(mutex_);
         init_success_ = false;
         prefix_to_cadicates_.clear();
+        controlled_tokens_.clear();
+        config = TreeDecodeConfig{};
 
         // Try optimized streaming parser first for large files
         bool schema_error = false;
         if (loadPrefixDictStreaming(file_path, schema_error)) {
+            buildControlledTokens();
             init_success_ = true;
             RTP_LLM_LOG_INFO("PrefixToCandidateTokens load [%s] successfully (streaming)", file_path.c_str());
             return;
@@ -492,8 +528,50 @@ private:
             prefix_to_cadicates_[kv.first] = tmp_set;
         }
         file.close();
+        buildControlledTokens();
         init_success_ = true;
         RTP_LLM_LOG_INFO("PrefixToCandidateTokens load [%s] successfully", file_path.c_str());
+    }
+
+    // Validate only the opt-in mode: old dictionaries retain their acceptance rules.
+    void buildControlledTokens() {
+        if (!config.allow_unlisted_tokens) {
+            return;
+        }
+        try {
+            if (config.start_token_id < 0 || config.end_token_id < 0 || config.sep.empty()) {
+                throw std::invalid_argument("allow_unlisted_tokens requires nonnegative start/end IDs and a separator");
+            }
+            const auto root = prefix_to_cadicates_.find(std::to_string(config.start_token_id));
+            if (root == prefix_to_cadicates_.end()) {
+                throw std::invalid_argument("allow_unlisted_tokens requires a root prefix");
+            }
+            std::unordered_set<const std::string*> reachable_keys = {&root->first};
+            controlled_tokens_.insert(config.end_token_id);
+            for (const auto& entry : prefix_to_cadicates_) {
+                for (auto token : entry.second) {
+                    if (token < 0) {
+                        throw std::invalid_argument("negative controlled token ID");
+                    }
+                    controlled_tokens_.insert(token);
+                    const auto next = prefix_to_cadicates_.find(entry.first + config.sep + std::to_string(token));
+                    if (next != prefix_to_cadicates_.end()) {
+                        reachable_keys.insert(&next->first);
+                    } else if (token != config.end_token_id) {
+                        throw std::invalid_argument("missing successor prefix for " + entry.first);
+                    }
+                }
+            }
+            // Every non-root key needs a parent edge. Keys grow on every edge, so
+            // this also rules out disconnected components without parsing the separator.
+            if (reachable_keys.size() != prefix_to_cadicates_.size()) {
+                throw std::invalid_argument("unreachable prefix in allow_unlisted_tokens dictionary");
+            }
+        } catch (...) {
+            prefix_to_cadicates_.clear();
+            controlled_tokens_.clear();
+            throw;
+        }
     }
 
     // Returns true on success. On failure, sets schema_error=true when the file is valid JSON but
@@ -518,8 +596,13 @@ private:
 
         bool success = false;
         if (reader.Parse(is, handler)) {
+            // Do not silently drop invalid IDs in the opt-in mode: otherwise an
+            // intended controlled token could become an unrestricted token.
+            if (local_config.allow_unlisted_tokens && handler.skippedCandidate()) {
+                throw std::invalid_argument("invalid candidate ID in allow_unlisted_tokens dictionary");
+            }
             success = true;
-            // NOTE: the streaming path only fills start/end/sep on config and writes the candidate
+            // NOTE: the streaming path fills scalar config fields and writes the candidate
             // sets directly into prefix_to_cadicates_; it intentionally does NOT populate
             // config.prefix_dict (unlike the legacy parser). Runtime lookups only ever use
             // prefix_to_cadicates_, so this is equivalent. Do not rely on config.prefix_dict after a
@@ -529,6 +612,9 @@ private:
         } else {
             // Distinguish a handler-triggered schema/type abort from a genuine JSON syntax error.
             schema_error                = handler.schemaError();
+            if (schema_error && local_config.allow_unlisted_tokens) {
+                throw std::invalid_argument("invalid allow_unlisted_tokens dictionary schema");
+            }
             rapidjson::ParseErrorCode e = reader.GetParseErrorCode();
             size_t                    o = reader.GetErrorOffset();
             RTP_LLM_LOG_WARNING(
@@ -542,6 +628,7 @@ private:
     std::mutex                                                   mutex_;
     TreeDecodeConfig                                             config;
     std::unordered_map<std::string, std::unordered_set<int32_t>> prefix_to_cadicates_;
+    std::unordered_set<int32_t>                                  controlled_tokens_;
     bool                                                         init_success_ = false;
 };
 

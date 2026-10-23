@@ -6,6 +6,8 @@
 #include "rtp_llm/cpp/models/logits_processor/LogitsProcessorStates.h"
 #include "rtp_llm/cpp/models/logits_processor/PrefixToCandidateTokens.h"
 #include <unistd.h>
+#include <fstream>
+#include <cmath>
 
 using namespace std;
 
@@ -237,6 +239,181 @@ TEST_F(TreeLogitsProcessorTest, testProcess) {
         ASSERT_EQ(logits_hosts[64011], 0);
         ASSERT_TRUE(logits_hosts[64001] == -INFINITY);
     }
+}
+
+
+class UnlistedTreeLogitsProcessorTest: public DeviceTestBase {
+protected:
+    void SetUp() override {
+        DeviceTestBase::SetUp();
+        path_ = "/tmp/unlisted_tree_logits_" + std::to_string(getpid()) + ".json";
+        load("true");
+    }
+    void TearDown() override {
+        std::remove(path_.c_str());
+        DeviceTestBase::TearDown();
+    }
+    void load(const std::string& mode) {
+        std::ofstream file(path_);
+        file << "{";
+        if (!mode.empty()) {
+            file << "\"allow_unlisted_tokens\":" << mode << ",";
+        }
+        file << R"("start_token_id":1,"end_token_id":2,"prefix_dict":{
+            "1":[10,20],"1_10":[30],"1_10_30":[],"1_20":[40],"1_20_40":[2]}})";
+        file.close();
+        PrefixToCandidateTokens::instance()->reloadPrefixDict(path_);
+        ASSERT_TRUE(PrefixToCandidateTokens::instance()->initSuccess());
+    }
+    StreamTreeInfo info(const std::string& state = "1", bool active = true, bool beam = false, int input_length = 0) {
+        auto dfa = std::make_shared<TreeDFA<std::string, int>>(PrefixToCandidateTokens::instance());
+        dfa->forceSetStatus(state);
+        return StreamTreeInfo(active, input_length, 0, beam, dfa);
+    }
+    torch::Tensor tokens(const std::vector<int>& values, int rows) {
+        return torch::tensor(values, torch::kInt32).reshape({rows, static_cast<int64_t>(values.size() / rows)});
+    }
+    // Check every vocabulary entry, including all ordinary tokens and unchanged rows.
+    void expectRow(const torch::Tensor& actual,
+                   const torch::Tensor& before,
+                   int row,
+                   const std::unordered_set<int>& blocked) {
+        const auto a = actual.cpu().to(torch::kFloat32).contiguous();
+        const auto b = before.cpu().to(torch::kFloat32).contiguous();
+        for (int token = 0; token < actual.size(1); ++token) {
+            SCOPED_TRACE("row=" + std::to_string(row) + " token=" + std::to_string(token));
+            const auto index = row * actual.size(1) + token;
+            if (blocked.count(token)) {
+                EXPECT_EQ(-INFINITY, a.data_ptr<float>()[index]);
+            } else {
+                EXPECT_EQ(b.data_ptr<float>()[index], a.data_ptr<float>()[index]);
+            }
+        }
+    }
+    std::string path_;
+};
+
+TEST_F(UnlistedTreeLogitsProcessorTest, MasksOnlyControlledTokensAcrossDtypesAndSubranges) {
+    for (auto dtype : {torch::kFloat32, torch::kFloat16, torch::kBFloat16}) {
+        SCOPED_TRACE(static_cast<int>(dtype));
+        TreeLogitsProcessor processor({info("1"), info("1_10"), info("1", false)});
+        SamplerInputs inputs;
+        inputs.logits = torch::arange(5 * 64, torch::kFloat32).reshape({5, 64}).to(dtype).to(torch::kCUDA);
+        const auto before = inputs.logits.clone();
+        ASSERT_FALSE(processor.process(inputs, 1, 4).has_value());
+        expectRow(inputs.logits, before, 0, {});
+        expectRow(inputs.logits, before, 1, {2, 30, 40});
+        expectRow(inputs.logits, before, 2, {2, 10, 20, 40});
+        expectRow(inputs.logits, before, 3, {}); // Inactive row in an active batch.
+        expectRow(inputs.logits, before, 4, {});
+    }
+}
+
+TEST_F(UnlistedTreeLogitsProcessorTest, ResetChangesNextStepMask) {
+    TreeLogitsProcessor processor({info()});
+    ASSERT_FALSE(processor.updateStatus(tokens({10}, 1), 1).has_value());
+    SamplerInputs inputs;
+    inputs.logits = torch::ones({1, 64}, torch::TensorOptions().device(torch::kCUDA));
+    auto before = inputs.logits.clone();
+    ASSERT_FALSE(processor.process(inputs, 0, 1).has_value());
+    expectRow(inputs.logits, before, 0, {2, 10, 20, 40});
+    ASSERT_FALSE(processor.updateStatus(tokens({9}, 1), 1).has_value());
+    EXPECT_EQ((std::vector<std::string>{"1"}), processor.getStatus());
+    inputs.logits = before.clone();
+    ASSERT_FALSE(processor.process(inputs, 0, 1).has_value());
+    expectRow(inputs.logits, before, 0, {2, 30, 40});
+}
+
+TEST_F(UnlistedTreeLogitsProcessorTest, BeamCopiesResetIndependentlyAndKeepOutputOffsets) {
+    TreeLogitsProcessor processor({info("1", true, true, 2)});
+    ASSERT_FALSE(processor.updateStatus(tokens({7, 8, 10}, 1), 1).has_value());
+    processor.updateMultiSeqStatus({0, 0});
+    ASSERT_FALSE(processor.updateStatus(tokens({7, 8, 10, 9, 7, 8, 10, 30}, 2), 1).has_value());
+    EXPECT_EQ((std::vector<std::string>{"1", "1_10_30"}), processor.getStatus());
+    // Reorder parents before the next step. Ordinary tokens still count in the
+    // full output offset even though they clear the controlled-token path.
+    processor.updateMultiSeqStatus({1, 0});
+    ASSERT_FALSE(processor.updateStatus(tokens({7, 8, 10, 30, 2, 7, 8, 10, 9, 20}, 2), 1).has_value());
+    EXPECT_EQ((std::vector<std::string>{"1_10_30_2", "1_20"}), processor.getStatus());
+    SamplerInputs inputs;
+    inputs.logits = torch::ones({2, 64}, torch::TensorOptions().device(torch::kCUDA));
+    const auto before = inputs.logits.clone();
+    ASSERT_FALSE(processor.process(inputs, 0, 2).has_value());
+    expectRow(inputs.logits, before, 0, {10, 20, 30, 40});
+    expectRow(inputs.logits, before, 1, {2, 10, 20, 30});
+}
+
+TEST_F(UnlistedTreeLogitsProcessorTest, MultiTokenUpdateRestartsWithinOneBatch) {
+    TreeLogitsProcessor processor({info()});
+    ASSERT_FALSE(processor.updateStatus(tokens({10, 9, 20, 40}, 1), 4).has_value());
+    EXPECT_EQ((std::vector<std::string>{"1_20_40"}), processor.getStatus());
+}
+
+TEST_F(UnlistedTreeLogitsProcessorTest, EmptyMissingAndFinishedStatesKeepOrdinaryTokens) {
+    auto finished = info("1_20_40");
+    finished.dfa_ptr->next(2);
+    TreeLogitsProcessor processor({info("1_10_30"), info("missing"), finished});
+    SamplerInputs inputs;
+    inputs.logits = torch::ones({3, 64}, torch::TensorOptions().device(torch::kCUDA));
+    const auto before = inputs.logits.clone();
+    ASSERT_FALSE(processor.process(inputs, 0, 3).has_value());
+    for (int row = 0; row < 3; ++row) {
+        expectRow(inputs.logits, before, row, {10, 20, 30, 40});
+    }
+    ASSERT_FALSE(processor.updateStatus(tokens({9, 9, 9}, 3), 1).has_value());
+    EXPECT_EQ((std::vector<std::string>{"1", "1", "1"}), processor.getStatus());
+}
+
+TEST_F(UnlistedTreeLogitsProcessorTest, DisabledAndMissingSwitchKeepStrictWhitelist) {
+    for (const std::string mode : {"false", ""}) {
+        load(mode);
+        TreeLogitsProcessor processor({info()});
+        SamplerInputs inputs;
+        inputs.logits = torch::ones({1, 64}, torch::TensorOptions().device(torch::kCUDA));
+        const auto before = inputs.logits.clone();
+        ASSERT_FALSE(processor.process(inputs, 0, 1).has_value());
+        std::unordered_set<int> blocked;
+        for (int token = 0; token < 64; ++token) {
+            if (token != 10 && token != 20) {
+                blocked.insert(token);
+            }
+        }
+        expectRow(inputs.logits, before, 0, blocked);
+    }
+}
+
+TEST_F(UnlistedTreeLogitsProcessorTest, OutOfVocabularyConfigurationReturnsErrorWithoutMasking) {
+    TreeLogitsProcessor processor({info()});
+    SamplerInputs inputs;
+    inputs.logits = torch::ones({1, 32}, torch::TensorOptions().device(torch::kCUDA));
+    const auto before = inputs.logits.clone();
+    // 40 is controlled but out of range, even though it is not a root candidate.
+    EXPECT_TRUE(processor.process(inputs, 0, 1).has_value());
+    EXPECT_TRUE(torch::equal(before, inputs.logits));
+}
+
+TEST_F(UnlistedTreeLogitsProcessorTest, InactiveProcessorLeavesAllLogitsUnchanged) {
+    TreeLogitsProcessor processor({info("1", false)});
+    SamplerInputs inputs;
+    inputs.logits = torch::ones({1, 64}, torch::TensorOptions().device(torch::kCUDA));
+    const auto before = inputs.logits.clone();
+    ASSERT_FALSE(processor.process(inputs, 0, 1).has_value());
+    EXPECT_TRUE(torch::equal(before, inputs.logits));
+}
+
+
+TEST_F(UnlistedTreeLogitsProcessorTest, OrdinaryTokenCanWinGreedySelection) {
+    TreeLogitsProcessor processor({info()});
+    SamplerInputs inputs;
+    inputs.logits = torch::zeros({1, 64}, torch::TensorOptions().device(torch::kCUDA));
+    inputs.logits[0][30] = 100; // Controlled, but not a root candidate.
+    inputs.logits[0][9] = 90;   // Ordinary token must remain selectable.
+    inputs.logits[0][10] = 80;
+    ASSERT_FALSE(processor.process(inputs, 0, 1).has_value());
+    EXPECT_EQ(9, inputs.logits.argmax(1).item<int64_t>());
+    const auto probs = torch::softmax(inputs.logits, 1).cpu();
+    EXPECT_EQ(0.0f, probs[0][30].item<float>());
+    EXPECT_GT(probs[0][9].item<float>(), 0.0f);
 }
 
 #undef EXPECT_SIMILAR

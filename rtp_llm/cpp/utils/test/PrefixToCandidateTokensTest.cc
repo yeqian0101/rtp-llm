@@ -380,4 +380,102 @@ TEST_F(PrefixToCandidateTokensTest, SAXEndTokenIdOverflow) {
     ASSERT_FALSE(inst->initSuccess()) << "out-of-range end_token_id must be a schema error";
 }
 
+
+TEST_F(PrefixToCandidateTokensTest, AllowUnlistedTokensDefaultsAndReload) {
+    auto inst = PrefixToCandidateTokens::instance();
+    for (const std::string flag : {"true", "false", "true", ""}) {
+        const auto field = flag.empty() ? "" : "\"allow_unlisted_tokens\":" + flag + ",";
+        const auto json = "{" + field + R"("start_token_id":1,"end_token_id":2,
+            "prefix_dict":{"1":[10,10,20],"1_10":[],"1_20":[2]}})";
+        writeJsonFile(tmp_path_, json);
+        inst->reloadPrefixDict(tmp_path_);
+        ASSERT_TRUE(inst->initSuccess());
+        EXPECT_EQ(flag == "true", inst->allowUnlistedTokens());
+        TreeDecodeConfig legacy;
+        legacy.allow_unlisted_tokens = true; // Missing field must reset an existing config too.
+        autil::legacy::FromJsonString(legacy, json);
+        EXPECT_EQ(flag == "true", legacy.allow_unlisted_tokens);
+        if (flag == "true") {
+            EXPECT_EQ((std::unordered_set<int32_t>{2, 10, 20}), inst->controlledTokens());
+            EXPECT_FALSE(inst->isControlledToken(1)); // Root marker alone is not a controlled output.
+        } else {
+            EXPECT_TRUE(inst->controlledTokens().empty());
+        }
+    }
+}
+
+TEST_F(PrefixToCandidateTokensTest, AllowUnlistedTokensFieldOrderAndUnknownFields) {
+    writeJsonFile(tmp_path_, R"({
+        "metadata":{"allow_unlisted_tokens":false,"nested":[true,null,{}]},
+        "start_token_id":1,"end_token_id":2,"sep":"::",
+        "prefix_dict":{"1":[10],"1::10":[]},"allow_unlisted_tokens":true
+    })");
+    auto inst = PrefixToCandidateTokens::instance();
+    inst->reloadPrefixDict(tmp_path_);
+    ASSERT_TRUE(inst->initSuccess());
+    EXPECT_TRUE(inst->allowUnlistedTokens());
+    EXPECT_EQ((std::unordered_set<int32_t>{2, 10}), inst->controlledTokens());
+    EXPECT_EQ("1::10", inst->generateNextKey("1", 10));
+}
+
+TEST_F(PrefixToCandidateTokensTest, AllowUnlistedTokensRejectsNonBooleanSwitch) {
+    auto inst = PrefixToCandidateTokens::instance();
+    for (const std::string value : {"1", "0", "1.5", "null", "\"true\"", "{}", "[]"}) {
+        SCOPED_TRACE(value);
+        writeJsonFile(tmp_path_, "{\"allow_unlisted_tokens\":" + value + ",\"prefix_dict\":{}}");
+        inst->reloadPrefixDict(tmp_path_);
+        EXPECT_FALSE(inst->initSuccess());
+        EXPECT_TRUE(inst->controlledTokens().empty());
+    }
+}
+
+TEST_F(PrefixToCandidateTokensTest, AllowUnlistedTokensRejectsInvalidTree) {
+    auto inst = PrefixToCandidateTokens::instance();
+    const std::vector<std::string> configs = {
+        R"({"start_token_id":-1,"prefix_dict":{"1":[]}})",
+        R"({"start_token_id":1,"end_token_id":-1,"prefix_dict":{"1":[]}})",
+        R"({"start_token_id":1,"sep":"","prefix_dict":{"1":[]}})",
+        R"({"start_token_id":1,"prefix_dict":{}})",
+        R"({"start_token_id":1,"prefix_dict":{"1":[10]}})",
+        R"({"start_token_id":1,"prefix_dict":{"1":[],"orphan":[2]}})",
+        R"({"start_token_id":1,"prefix_dict":{"1":[-1,2]}})",
+        R"({"start_token_id":1,"prefix_dict":{"1":[2147483648,2]}})"
+    };
+    for (const auto& config : configs) {
+        SCOPED_TRACE(config);
+        // Switch last: invalid token IDs must not be lost before the mode is known.
+        auto json = config.substr(0, config.size() - 1) + ",\"allow_unlisted_tokens\":true}";
+        writeJsonFile(tmp_path_, json);
+        EXPECT_THROW(inst->reloadPrefixDict(tmp_path_), std::invalid_argument);
+        EXPECT_FALSE(inst->initSuccess());
+        EXPECT_TRUE(inst->controlledTokens().empty());
+        // Identical legacy configs retain their former acceptance rules.
+        writeJsonFile(tmp_path_, config);
+        EXPECT_NO_THROW(inst->reloadPrefixDict(tmp_path_));
+        EXPECT_TRUE(inst->initSuccess());
+    }
+}
+
+TEST_F(PrefixToCandidateTokensTest, AllowUnlistedTokensFailureClearsPreviousConfiguration) {
+    auto inst = PrefixToCandidateTokens::instance();
+    writeJsonFile(tmp_path_, R"({"allow_unlisted_tokens":true,"prefix_dict":{"225":[2]}})");
+    inst->reloadPrefixDict(tmp_path_);
+    ASSERT_TRUE(inst->initSuccess());
+    writeJsonFile(tmp_path_, "not json");
+    inst->reloadPrefixDict(tmp_path_);
+    EXPECT_FALSE(inst->initSuccess());
+    EXPECT_FALSE(inst->allowUnlistedTokens());
+    EXPECT_TRUE(inst->controlledTokens().empty());
+}
+
+
+TEST_F(PrefixToCandidateTokensTest, AllowUnlistedTokensAcceptsExplicitEndStateAndRootAsOutput) {
+    writeJsonFile(tmp_path_, R"({"allow_unlisted_tokens":true,"start_token_id":1,"end_token_id":2,
+        "prefix_dict":{"1":[1],"1_1":[2],"1_1_2":[]}})");
+    auto inst = PrefixToCandidateTokens::instance();
+    inst->reloadPrefixDict(tmp_path_);
+    ASSERT_TRUE(inst->initSuccess());
+    EXPECT_EQ((std::unordered_set<int32_t>{1, 2}), inst->controlledTokens());
+}
+
 }  // namespace rtp_llm

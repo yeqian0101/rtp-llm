@@ -31,7 +31,36 @@ TreeLogitsProcessor::process(const SamplerInputs& inputs, size_t start_idx, size
 
     auto   batch_logits     = inputs.logits.narrow(0, start_idx, batch_size);
     size_t vocab_size       = batch_logits.size(1);
-    auto   batch_vocab_mask = generateVocabMask(batch_size, vocab_size, batch_candidate_token_ids);
+    torch::Tensor batch_vocab_mask;
+    const auto prefix = PrefixToCandidateTokens::instance();
+    if (prefix->allowUnlistedTokens()) {
+        // Validate before indexing; an out-of-vocabulary controlled token is a
+        // configuration error, not permission to fall back to unconstrained decoding.
+        for (auto token : prefix->controlledTokens()) {
+            if (token < 0 || static_cast<size_t>(token) >= vocab_size) {
+                return ErrorInfo(ErrorCode::INVALID_PARAMS, "tree decode controlled token is outside the vocabulary");
+            }
+        }
+        auto mask_cpu = torch::zeros({(int64_t)batch_size, (int64_t)vocab_size}, torch::kUInt8);
+        auto mask = mask_cpu.data_ptr<uint8_t>();
+        for (size_t i = 0; i < batch_size; ++i) {
+            if (!tree_infos_[i].in_tree_mode) {
+                continue;
+            }
+            for (auto token : prefix->controlledTokens()) {
+                mask[i * vocab_size + token] = 1;
+            }
+            for (auto token : batch_candidate_token_ids[i]) {
+                if (token >= vocab_size) {
+                    return ErrorInfo(ErrorCode::INVALID_PARAMS, "tree decode candidate is outside the vocabulary");
+                }
+                mask[i * vocab_size + token] = 0;
+            }
+        }
+        batch_vocab_mask = mask_cpu.to(batch_logits.device());
+    } else {
+        batch_vocab_mask = generateVocabMask(batch_size, vocab_size, batch_candidate_token_ids);
+    }
     maskLogits(batch_logits, batch_vocab_mask);
     return std::nullopt;
 }

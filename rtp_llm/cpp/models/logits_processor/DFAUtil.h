@@ -1,6 +1,10 @@
 #pragma once
 
 #include <memory>
+#include <algorithm>
+#include <cstdint>
+#include <limits>
+#include <type_traits>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -124,7 +128,7 @@ public:
     TreeDFA(PrefixToCandidateTokensPtr prefixToCandidateTokensPtr):
         prefixToCandidateTokensPtr_(prefixToCandidateTokensPtr),
         status_(std::to_string(prefixToCandidateTokensPtr->startTokenId())),
-        input_list_(10) {}
+        input_list_(prefixToCandidateTokensPtr->allowUnlistedTokens() ? 0 : 10) {}
 
     TreeDFA(TreeDFA&)  = default;
     TreeDFA(TreeDFA&&) = default;
@@ -149,6 +153,31 @@ public:
     }
 
     std::string next(InputType input) override {
+        if (prefixToCandidateTokensPtr_->allowUnlistedTokens()) {
+            // Ordinary tokens break the controlled sequence, even after EOS/error.
+            // Reject invalid signed inputs rather than treating them as ordinary tokens.
+            if constexpr (std::is_signed<InputType>::value) {
+                if (input < 0) {
+                    error_ = true;
+                    return status_;
+                }
+            }
+            if (static_cast<uint64_t>(input) > static_cast<uint64_t>(std::numeric_limits<int32_t>::max())) {
+                error_ = true;
+                return status_;
+            }
+            if (!prefixToCandidateTokensPtr_->isControlledToken(static_cast<int32_t>(input))) {
+                status_ = std::to_string(prefixToCandidateTokensPtr_->startTokenId());
+                input_list_.clear();
+                error_ = false;
+                return status_;
+            }
+            const auto candidates = getCandidateTokenIds();
+            if (std::find(candidates.begin(), candidates.end(), static_cast<size_t>(input)) == candidates.end()) {
+                error_ = true;
+                return status_;
+            }
+        }
         if (isFinished() || error_) {
             return status_;
         }
@@ -167,7 +196,7 @@ public:
     }
 
     std::vector<size_t> getCandidateTokenIds() {
-        if (error_) {
+        if (error_ || (prefixToCandidateTokensPtr_->allowUnlistedTokens() && isFinished())) {
             return {static_cast<size_t>(prefixToCandidateTokensPtr_->endTokenId())};
         }
         std::vector<size_t> token_ids;
