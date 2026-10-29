@@ -487,7 +487,11 @@ private:
         if (loadPrefixDictStreaming(file_path, schema_error)) {
             buildControlledTokens();
             init_success_ = true;
-            RTP_LLM_LOG_INFO("PrefixToCandidateTokens load [%s] successfully (streaming)", file_path.c_str());
+            RTP_LLM_LOG_INFO("PrefixToCandidateTokens load [%s] successfully (streaming): "
+                             "allow_unlisted_tokens=%s, controlled_token_count=%zu",
+                             file_path.c_str(),
+                             config.allow_unlisted_tokens ? "true" : "false",
+                             controlled_tokens_.size());
             return;
         }
         if (schema_error) {
@@ -530,7 +534,11 @@ private:
         file.close();
         buildControlledTokens();
         init_success_ = true;
-        RTP_LLM_LOG_INFO("PrefixToCandidateTokens load [%s] successfully", file_path.c_str());
+        RTP_LLM_LOG_INFO("PrefixToCandidateTokens load [%s] successfully: "
+                         "allow_unlisted_tokens=%s, controlled_token_count=%zu",
+                         file_path.c_str(),
+                         config.allow_unlisted_tokens ? "true" : "false",
+                         controlled_tokens_.size());
     }
 
     // Validate only the opt-in mode: old dictionaries retain their acceptance rules.
