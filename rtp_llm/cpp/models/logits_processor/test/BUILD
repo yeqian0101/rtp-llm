@@ -63,6 +63,16 @@ cc_test(
 )
 
 cc_test(
+    name = "tree_logits_processor_perf_test",
+    srcs = ["TreeLogitsProcessorPerfTest.cc"],
+    copts = test_copts,
+    deps = test_deps,
+    env = {"TEST_USING_DEVICE": "CUDA"},
+    tags = ["manual", "RTX_5000_PRO_CU13"],
+    exec_properties = {"gpu": "RTX_5000_PRO_CU13"},
+)
+
+cc_test(
     name = "recommendation_logits_processor_test",
     srcs = [
         "RecommendationLogitsProcessorTest.cc",
