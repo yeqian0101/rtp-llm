@@ -87,6 +87,57 @@ mask_logits(const int batch_size, const int vocab_size, T* logits_batch, const u
 
 #if USING_CUDA
 template<typename T>
+__global__ void tree_sparse_mask(T* logits, const int32_t* controlled, int64_t controlled_count,
+                                 const int32_t* candidates, const int64_t* offsets, const int32_t* rows,
+                                 int64_t row_count, int64_t row_stride) {
+    const int64_t total = row_count * controlled_count;
+    for (int64_t index = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+         index < total; index += static_cast<int64_t>(blockDim.x) * gridDim.x) {
+        const int64_t row = index / controlled_count;
+        if (rows[row] < 0) {
+            continue;
+        }
+        const int32_t token = controlled[index % controlled_count];
+        int64_t left = offsets[row];
+        int64_t right = offsets[row + 1];
+        const int64_t end = right;
+        while (left < right) {
+            const int64_t middle = left + (right - left) / 2;
+            if (candidates[middle] < token) {
+                left = middle + 1;
+            } else {
+                right = middle;
+            }
+        }
+        if (left == end || candidates[left] != token) {
+            logits[static_cast<int64_t>(rows[row]) * row_stride + token] = NegativeInfinity<T>();
+        }
+    }
+}
+
+template<typename T>
+void invokeTreeSparseMask(T* logits, const int32_t* controlled, int64_t controlled_count,
+                          const int32_t* candidates, const int64_t* offsets, const int32_t* rows,
+                          int64_t row_count, int64_t row_stride, cudaStream_t stream) {
+    const int64_t blocks = (row_count * controlled_count + 255) / 256;
+    if (blocks == 0) {
+        return;
+    }
+    tree_sparse_mask<<<static_cast<unsigned>(blocks < 65535 ? blocks : 65535), 256, 0, stream>>>(
+        logits, controlled, controlled_count, candidates, offsets, rows, row_count, row_stride);
+    check_cuda_value(cudaPeekAtLastError());
+}
+
+template void invokeTreeSparseMask<float>(float*, const int32_t*, int64_t, const int32_t*, const int64_t*,
+                                           const int32_t*, int64_t, int64_t, cudaStream_t);
+template void invokeTreeSparseMask<half>(half*, const int32_t*, int64_t, const int32_t*, const int64_t*,
+                                          const int32_t*, int64_t, int64_t, cudaStream_t);
+template void invokeTreeSparseMask<__nv_bfloat16>(__nv_bfloat16*, const int32_t*, int64_t, const int32_t*,
+                                                   const int64_t*, const int32_t*, int64_t, int64_t, cudaStream_t);
+#endif
+
+#if USING_CUDA
+template<typename T>
 __global__ void packed_mask_logits(T* __restrict__ logits_batch,
                                    const int32_t* __restrict__ packed_allow_mask,
                                    const int32_t* __restrict__ row_indices,

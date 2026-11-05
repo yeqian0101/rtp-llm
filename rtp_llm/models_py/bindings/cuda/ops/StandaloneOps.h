@@ -2,6 +2,8 @@
 
 #include "torch/all.h"
 #include <cuda_runtime.h>
+#include <memory>
+#include <vector>
 
 namespace rtp_llm {
 
@@ -17,5 +19,12 @@ void cudaSoftmaxInplace(torch::Tensor& input, cudaStream_t stream);
 // mask: [batch_size, vocab_size] on CUDA, UINT8
 // Modifies logits in-place: sets masked positions to -inf.
 void cudaMaskLogits(torch::Tensor& logits, const torch::Tensor& mask, cudaStream_t stream);
+
+// Per-processor staging buffers. Definition stays in the CUDA implementation.
+struct TreeSparseMaskState;
+void cudaTreeSparseMask(torch::Tensor& logits, uint64_t generation,
+                        const std::vector<int32_t>& controlled,
+                        const std::vector<const std::vector<int32_t>*>& candidates,
+                        std::shared_ptr<TreeSparseMaskState>& state);
 
 }  // namespace rtp_llm

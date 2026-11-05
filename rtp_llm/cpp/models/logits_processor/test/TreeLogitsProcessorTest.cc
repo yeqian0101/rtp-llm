@@ -8,6 +8,8 @@
 #include <unistd.h>
 #include <fstream>
 #include <cmath>
+#include <ATen/cuda/CUDAContext.h>
+#include <c10/cuda/CUDAGuard.h>
 
 using namespace std;
 
@@ -242,7 +244,7 @@ TEST_F(TreeLogitsProcessorTest, testProcess) {
 }
 
 
-class UnlistedTreeLogitsProcessorTest: public DeviceTestBase {
+class UnlistedTreeLogitsProcessorTest: public DeviceTestBase, public ::testing::WithParamInterface<bool> {
 protected:
     void SetUp() override {
         DeviceTestBase::SetUp();
@@ -253,9 +255,10 @@ protected:
         std::remove(path_.c_str());
         DeviceTestBase::TearDown();
     }
-    void load(const std::string& mode) {
+    void load(const std::string& mode) { load(mode, GetParam()); }
+    void load(const std::string& mode, bool sparse) {
         std::ofstream file(path_);
-        file << "{";
+        file << "{\"tree_decode_gpu_sparse_mask\":" << (sparse ? "true" : "false") << ",";
         if (!mode.empty()) {
             file << "\"allow_unlisted_tokens\":" << mode << ",";
         }
@@ -293,7 +296,7 @@ protected:
     std::string path_;
 };
 
-TEST_F(UnlistedTreeLogitsProcessorTest, MasksOnlyControlledTokensAcrossDtypesAndSubranges) {
+TEST_P(UnlistedTreeLogitsProcessorTest, MasksOnlyControlledTokensAcrossDtypesAndSubranges) {
     for (auto dtype : {torch::kFloat32, torch::kFloat16, torch::kBFloat16}) {
         SCOPED_TRACE(static_cast<int>(dtype));
         TreeLogitsProcessor processor({info("1"), info("1_10"), info("1", false)});
@@ -309,7 +312,7 @@ TEST_F(UnlistedTreeLogitsProcessorTest, MasksOnlyControlledTokensAcrossDtypesAnd
     }
 }
 
-TEST_F(UnlistedTreeLogitsProcessorTest, ResetChangesNextStepMask) {
+TEST_P(UnlistedTreeLogitsProcessorTest, ResetChangesNextStepMask) {
     TreeLogitsProcessor processor({info()});
     ASSERT_FALSE(processor.updateStatus(tokens({10}, 1), 1).has_value());
     SamplerInputs inputs;
@@ -324,7 +327,7 @@ TEST_F(UnlistedTreeLogitsProcessorTest, ResetChangesNextStepMask) {
     expectRow(inputs.logits, before, 0, {2, 30, 40});
 }
 
-TEST_F(UnlistedTreeLogitsProcessorTest, BeamCopiesResetIndependentlyAndKeepOutputOffsets) {
+TEST_P(UnlistedTreeLogitsProcessorTest, BeamCopiesResetIndependentlyAndKeepOutputOffsets) {
     TreeLogitsProcessor processor({info("1", true, true, 2)});
     ASSERT_FALSE(processor.updateStatus(tokens({7, 8, 10}, 1), 1).has_value());
     processor.updateMultiSeqStatus({0, 0});
@@ -343,13 +346,13 @@ TEST_F(UnlistedTreeLogitsProcessorTest, BeamCopiesResetIndependentlyAndKeepOutpu
     expectRow(inputs.logits, before, 1, {2, 10, 20, 30});
 }
 
-TEST_F(UnlistedTreeLogitsProcessorTest, MultiTokenUpdateRestartsWithinOneBatch) {
+TEST_P(UnlistedTreeLogitsProcessorTest, MultiTokenUpdateRestartsWithinOneBatch) {
     TreeLogitsProcessor processor({info()});
     ASSERT_FALSE(processor.updateStatus(tokens({10, 9, 20, 40}, 1), 4).has_value());
     EXPECT_EQ((std::vector<std::string>{"1_20_40"}), processor.getStatus());
 }
 
-TEST_F(UnlistedTreeLogitsProcessorTest, EmptyMissingAndFinishedStatesKeepOrdinaryTokens) {
+TEST_P(UnlistedTreeLogitsProcessorTest, EmptyMissingAndFinishedStatesKeepOrdinaryTokens) {
     auto finished = info("1_20_40");
     finished.dfa_ptr->next(2);
     TreeLogitsProcessor processor({info("1_10_30"), info("missing"), finished});
@@ -364,7 +367,7 @@ TEST_F(UnlistedTreeLogitsProcessorTest, EmptyMissingAndFinishedStatesKeepOrdinar
     EXPECT_EQ((std::vector<std::string>{"1", "1", "1"}), processor.getStatus());
 }
 
-TEST_F(UnlistedTreeLogitsProcessorTest, DisabledAndMissingSwitchKeepStrictWhitelist) {
+TEST_P(UnlistedTreeLogitsProcessorTest, DisabledAndMissingSwitchKeepStrictWhitelist) {
     for (const std::string mode : {"false", ""}) {
         load(mode);
         TreeLogitsProcessor processor({info()});
@@ -382,7 +385,7 @@ TEST_F(UnlistedTreeLogitsProcessorTest, DisabledAndMissingSwitchKeepStrictWhitel
     }
 }
 
-TEST_F(UnlistedTreeLogitsProcessorTest, OutOfVocabularyConfigurationReturnsErrorWithoutMasking) {
+TEST_P(UnlistedTreeLogitsProcessorTest, OutOfVocabularyConfigurationReturnsErrorWithoutMasking) {
     TreeLogitsProcessor processor({info()});
     SamplerInputs inputs;
     inputs.logits = torch::ones({1, 32}, torch::TensorOptions().device(torch::kCUDA));
@@ -392,7 +395,7 @@ TEST_F(UnlistedTreeLogitsProcessorTest, OutOfVocabularyConfigurationReturnsError
     EXPECT_TRUE(torch::equal(before, inputs.logits));
 }
 
-TEST_F(UnlistedTreeLogitsProcessorTest, InactiveProcessorLeavesAllLogitsUnchanged) {
+TEST_P(UnlistedTreeLogitsProcessorTest, InactiveProcessorLeavesAllLogitsUnchanged) {
     TreeLogitsProcessor processor({info("1", false)});
     SamplerInputs inputs;
     inputs.logits = torch::ones({1, 64}, torch::TensorOptions().device(torch::kCUDA));
@@ -402,7 +405,7 @@ TEST_F(UnlistedTreeLogitsProcessorTest, InactiveProcessorLeavesAllLogitsUnchange
 }
 
 
-TEST_F(UnlistedTreeLogitsProcessorTest, OrdinaryTokenCanWinGreedySelection) {
+TEST_P(UnlistedTreeLogitsProcessorTest, OrdinaryTokenCanWinGreedySelection) {
     TreeLogitsProcessor processor({info()});
     SamplerInputs inputs;
     inputs.logits = torch::zeros({1, 64}, torch::TensorOptions().device(torch::kCUDA));
@@ -415,6 +418,129 @@ TEST_F(UnlistedTreeLogitsProcessorTest, OrdinaryTokenCanWinGreedySelection) {
     EXPECT_EQ(0.0f, probs[0][30].item<float>());
     EXPECT_GT(probs[0][9].item<float>(), 0.0f);
 }
+
+TEST_P(UnlistedTreeLogitsProcessorTest, BufferReuseAndReloadPreserveUpstreamMasks) {
+    TreeLogitsProcessor processor({info(), info("1_10")});
+    for (int step = 0; step < 12; ++step) {
+        if (step == 6) {
+            load("true"); // Existing processor must invalidate its GPU cache.
+        }
+        const int rows = step % 2 ? 3 : 2;
+        processor.updateMultiSeqStatus(rows == 3 ? std::vector<int>{0, 1, 0} : std::vector<int>{0, 1});
+        SamplerInputs inputs;
+        inputs.logits = torch::randn({rows, 64}, torch::TensorOptions().device(torch::kCUDA));
+        inputs.logits[0][10] = -INFINITY; // Legal here, but forbidden by an upstream processor.
+        inputs.logits[0][9] = -INFINITY;  // Ordinary token must also remain forbidden.
+        auto before = inputs.logits.clone();
+        ASSERT_FALSE(processor.process(inputs, 0, rows).has_value());
+        expectRow(inputs.logits, before, 0, {2, 30, 40});
+        expectRow(inputs.logits, before, 1, {2, 10, 20, 40});
+        if (rows == 3) {
+            expectRow(inputs.logits, before, 2, {2, 30, 40});
+        }
+    }
+}
+
+TEST_P(UnlistedTreeLogitsProcessorTest, SparseCrossStreamReuseAndStridedRows) {
+    if (!GetParam()) {
+        GTEST_SKIP() << "Noncontiguous rows are an additional sparse-path capability";
+    }
+    auto moving = info();
+    TreeLogitsProcessor processor({moving, info("1_10"), info("1", false)});
+    auto other = info();
+    TreeLogitsProcessor second({other, info("1_10"), info("1", false)});
+    const auto first_stream = at::cuda::getStreamFromPool();
+    const auto second_stream = at::cuda::getStreamFromPool();
+    std::vector<torch::Tensor> actual, expected;
+    // Do not synchronize between calls: both slots must protect in-flight data,
+    // and two processors share the controlled cache across streams.
+    for (int step = 0; step < 10; ++step) {
+        // Vary data each time a ring slot is reused, so premature overwrites
+        // cannot pass unnoticed simply because all uploads contain equal IDs.
+        moving.dfa_ptr->forceSetStatus(step % 3 == 0 ? "1" : "1_20");
+        other.dfa_ptr->forceSetStatus(step % 3 == 0 ? "1" : "1_20");
+        const c10::cuda::CUDAStreamGuard guard(step % 2 ? first_stream : second_stream);
+        SamplerInputs inputs;
+        auto backing = torch::randn({5, 80}, torch::TensorOptions().device(torch::kCUDA));
+        inputs.logits = backing.narrow(1, 0, 64);
+        auto before = inputs.logits.clone();
+        ASSERT_FALSE(processor.process(inputs, 1, 4).has_value());
+        ASSERT_FALSE(second.process(inputs, 1, 4).has_value());
+        actual.push_back(inputs.logits);
+        expected.push_back(before);
+    }
+    first_stream.synchronize();
+    second_stream.synchronize();
+    for (size_t step = 0; step < actual.size(); ++step) {
+        expectRow(actual[step], expected[step], 0, {});
+        expectRow(actual[step], expected[step], 1,
+                  step % 3 == 0 ? std::unordered_set<int>{2, 30, 40} : std::unordered_set<int>{2, 10, 20, 30});
+        expectRow(actual[step], expected[step], 2, {2, 10, 20, 40});
+        expectRow(actual[step], expected[step], 3, {});
+        expectRow(actual[step], expected[step], 4, {});
+    }
+}
+
+TEST_P(UnlistedTreeLogitsProcessorTest, SparseRejectsNonUnitTokenStride) {
+    if (!GetParam()) {
+        GTEST_SKIP() << "Sparse layout validation";
+    }
+    TreeLogitsProcessor processor({info(), info()});
+    SamplerInputs inputs;
+    inputs.logits = torch::ones({64, 2}, torch::TensorOptions().device(torch::kCUDA)).transpose(0, 1);
+    auto before = inputs.logits.clone();
+    EXPECT_TRUE(processor.process(inputs, 0, 2).has_value());
+    EXPECT_TRUE(torch::equal(before, inputs.logits));
+}
+
+TEST_P(UnlistedTreeLogitsProcessorTest, DenseSparseRandomLogitsAreExactlyEqual) {
+    for (auto dtype : {torch::kFloat32, torch::kFloat16, torch::kBFloat16}) {
+        auto original = torch::randn({8, 64}, torch::TensorOptions().device(torch::kCUDA).dtype(dtype));
+        original[0][10] = -INFINITY;
+        original[0][9] = -INFINITY;
+        std::vector<torch::Tensor> outputs;
+        for (bool sparse : {false, true}) {
+            load("true", sparse);
+            auto finished = info("1_20_40");
+            finished.dfa_ptr->next(2);
+            auto error = info();
+            error.dfa_ptr->next(30);
+            TreeLogitsProcessor processor({info(), info("1_10"), info("1_20"), info("1_10_30"),
+                                           info("missing"), finished, error, info("1", false)});
+            SamplerInputs inputs;
+            inputs.logits = original.clone();
+            ASSERT_FALSE(processor.process(inputs, 0, 8).has_value());
+            outputs.push_back(inputs.logits.clone());
+        }
+        EXPECT_TRUE(torch::equal(outputs[0], outputs[1]));
+    }
+}
+
+TEST_P(UnlistedTreeLogitsProcessorTest, SparseReloadChangesControlledDomainAndEosZero) {
+    if (!GetParam()) {
+        GTEST_SKIP() << "GPU cache invalidation";
+    }
+    TreeLogitsProcessor processor({info()});
+    SamplerInputs inputs;
+    inputs.logits = torch::ones({1, 64}, torch::TensorOptions().device(torch::kCUDA));
+    ASSERT_FALSE(processor.process(inputs, 0, 1).has_value());
+    // Remove the old controlled set, and introduce EOS=0 and a vocabulary boundary token.
+    std::ofstream file(path_);
+    file << R"({"allow_unlisted_tokens":true,"tree_decode_gpu_sparse_mask":true,"start_token_id":1,
+        "end_token_id":0,"prefix_dict":{"1":[63],"1_63":[]}})";
+    file.close();
+    PrefixToCandidateTokens::instance()->reloadPrefixDict(path_);
+    inputs.logits.fill_(1);
+    auto before = inputs.logits.clone();
+    ASSERT_FALSE(processor.process(inputs, 0, 1).has_value());
+    expectRow(inputs.logits, before, 0, {0});
+    ASSERT_FALSE(processor.updateStatus(tokens({63}, 1), 1).has_value());
+    inputs.logits.fill_(1);
+    ASSERT_FALSE(processor.process(inputs, 0, 1).has_value());
+    expectRow(inputs.logits, before, 0, {63});
+}
+
+INSTANTIATE_TEST_SUITE_P(DenseAndSparse, UnlistedTreeLogitsProcessorTest, ::testing::Bool());
 
 #undef EXPECT_SIMILAR
 

@@ -57,7 +57,12 @@ struct TempDictionary {
         close(fd);
         path = buffer.data();
         std::ofstream out(path);
-        out << R"({"allow_unlisted_tokens":true,"start_token_id":1,"end_token_id":2,"prefix_dict":{"1":[)";
+        const auto sparse = envValue("TREE_PERF_SPARSE_MASK", "0");
+        if (sparse != "0" && sparse != "1") {
+            throw std::invalid_argument("TREE_PERF_SPARSE_MASK must be 0 or 1");
+        }
+        out << "{\"tree_decode_gpu_sparse_mask\":" << (sparse == "1" ? "true" : "false") << ",";
+        out << R"("allow_unlisted_tokens":true,"start_token_id":1,"end_token_id":2,"prefix_dict":{"1":[)";
         for (int i = 0; i < controlled_count; ++i) {
             out << (i ? "," : "") << i + 10;
         }
@@ -196,6 +201,7 @@ TEST(TreeLogitsProcessorPerfTest, PhaseBreakdown) {
     checkCuda(cudaGetDeviceProperties(&properties, device));
     std::cout << "[tree-perf] gpu=" << properties.name << " vocab=" << vocab
               << " controlled=" << prefix->controlledTokens().size() << " dtype=" << dtype_name
+              << " sparse=" << (prefix->gpuSparseMask() ? "true" : "false")
               << " warmup=" << warmup << " iterations=" << iterations
               << " dictionary=" << (external.empty() ? "synthetic" : external) << std::endl;
 
@@ -238,7 +244,9 @@ TEST(TreeLogitsProcessorPerfTest, PhaseBreakdown) {
             const size_t bytes = static_cast<size_t>(batch) * vocab;
             std::cout << "[tree-perf] case beams=" << batch << " scenario=" << scenario
                       << " state=" << (scenario < states.size() ? states[scenario] : "mixed")
-                      << " candidates_total=" << candidate_count << " mask_bytes=" << bytes << std::endl;
+                      << " candidates_total=" << candidate_count << " mask_bytes=" << bytes
+                      << " sparse_h2d_bytes=" << (candidate_count * sizeof(int32_t)
+                          + (batch + 1) * sizeof(int64_t) + batch * sizeof(int32_t)) << std::endl;
             auto host_mask = makeMask(candidates, vocab, prefix);
             auto device_mask = host_mask.to(torch::Device(torch::kCUDA, device));
             auto copy_target = torch::empty_like(device_mask);

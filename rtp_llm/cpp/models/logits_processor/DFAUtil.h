@@ -172,8 +172,16 @@ public:
                 error_ = false;
                 return status_;
             }
-            const auto candidates = getCandidateTokenIds();
-            if (std::find(candidates.begin(), candidates.end(), static_cast<size_t>(input)) == candidates.end()) {
+            bool allowed = false;
+            if (prefixToCandidateTokensPtr_->gpuSparseMask()) {
+                const auto& candidates = getSortedCandidateTokenIds();
+                allowed = std::binary_search(candidates.begin(), candidates.end(), static_cast<int32_t>(input));
+            } else {
+                const auto candidates = getCandidateTokenIds();
+                allowed = std::find(candidates.begin(), candidates.end(), static_cast<size_t>(input))
+                          != candidates.end();
+            }
+            if (!allowed) {
                 error_ = true;
                 return status_;
             }
@@ -193,6 +201,14 @@ public:
             error_ = true;
         }
         return status_;
+    }
+
+    // Used when the sparse switch is enabled; the dictionary caches sorted candidates.
+    const std::vector<int32_t>& getSortedCandidateTokenIds() {
+        if (error_ || isFinished()) {
+            return prefixToCandidateTokensPtr_->eosCandidates();
+        }
+        return prefixToCandidateTokensPtr_->sortedCandidates(status_);
     }
 
     std::vector<size_t> getCandidateTokenIds() {

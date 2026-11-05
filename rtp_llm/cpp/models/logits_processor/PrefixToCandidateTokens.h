@@ -1,6 +1,7 @@
 #pragma once
 
 #include <vector>
+#include <algorithm>
 #include <cstring>
 #include <cstdio>
 #include <fstream>
@@ -28,6 +29,7 @@ public:
     int32_t                                     end_token_id;
     std::string                                 sep;
     bool                                        allow_unlisted_tokens = false;
+    bool                                        tree_decode_gpu_sparse_mask = false;
     std::map<std::string, std::vector<int32_t>> prefix_dict;
 
     void Jsonize(autil::legacy::Jsonizable::JsonWrapper& json) override {
@@ -35,6 +37,7 @@ public:
         json.Jsonize("end_token_id", end_token_id, 2);
         json.Jsonize("sep", sep, "_");
         json.Jsonize("allow_unlisted_tokens", allow_unlisted_tokens, false);
+        json.Jsonize("tree_decode_gpu_sparse_mask", tree_decode_gpu_sparse_mask, false);
         json.Jsonize("prefix_dict", prefix_dict, prefix_dict);
     }
 };
@@ -55,6 +58,7 @@ public:
         config_.end_token_id          = 2;    // default
         config_.sep                   = "_";  // default
         config_.allow_unlisted_tokens = false;
+        config_.tree_decode_gpu_sparse_mask = false;
     }
 
     bool Null() {
@@ -73,8 +77,12 @@ public:
         if (depth_ == 0) {
             return typeError("root must be a JSON object");
         }
-        if (depth_ == 1 && !in_array_ && current_key_ == "allow_unlisted_tokens") {
-            config_.allow_unlisted_tokens = value;
+        if (depth_ == 1 && !in_array_ && isBooleanKey(current_key_)) {
+            if (current_key_ == "allow_unlisted_tokens") {
+                config_.allow_unlisted_tokens = value;
+            } else {
+                config_.tree_decode_gpu_sparse_mask = value;
+            }
             current_key_.clear();
             return true;
         }
@@ -147,8 +155,8 @@ public:
         }
         if (depth_ == 1) {
             // value of a root-level key
-            if (current_key_ == "allow_unlisted_tokens") {
-                return typeError("allow_unlisted_tokens must be a boolean, got string");
+            if (isBooleanKey(current_key_)) {
+                return typeError("tree decode switch must be a boolean, got string");
             }
             if (current_key_ == "sep") {
                 config_.sep = std::string(str, length);
@@ -183,8 +191,8 @@ public:
                 in_prefix_dict_ = true;
             } else if (current_key_ == "start_token_id" || current_key_ == "end_token_id") {
                 return typeError("start_token_id/end_token_id must be an integer, got object");
-            } else if (current_key_ == "allow_unlisted_tokens") {
-                return typeError("allow_unlisted_tokens must be a boolean, got object");
+            } else if (isBooleanKey(current_key_)) {
+                return typeError("tree decode switch must be a boolean, got object");
             } else if (current_key_ == "sep") {
                 return typeError("sep must be a string, got object");
             } else if (!current_key_.empty()) {
@@ -294,9 +302,13 @@ public:
     }
 
 private:
+    static bool isBooleanKey(const std::string& key) {
+        return key == "allow_unlisted_tokens" || key == "tree_decode_gpu_sparse_mask";
+    }
+
     static bool isKnownRootKey(const std::string& key) {
         return key == "start_token_id" || key == "end_token_id" || key == "sep" || key == "prefix_dict"
-               || key == "allow_unlisted_tokens";
+               || isBooleanKey(key);
     }
 
     bool typeError(const std::string& msg) {
@@ -335,8 +347,8 @@ private:
                 to_start = true;
             } else if (current_key_ == "end_token_id") {
                 to_end = true;
-            } else if (current_key_ == "allow_unlisted_tokens") {
-                return typeError("allow_unlisted_tokens must be a boolean, got number");
+            } else if (isBooleanKey(current_key_)) {
+                return typeError("tree decode switch must be a boolean, got number");
             } else if (current_key_ == "sep") {
                 return typeError("sep must be a string, got number");
             } else if (current_key_ == "prefix_dict") {
@@ -429,6 +441,16 @@ public:
     bool allowUnlistedTokens() const {
         return config.allow_unlisted_tokens;
     }
+    bool gpuSparseMask() const { return config.tree_decode_gpu_sparse_mask; }
+    uint64_t generation() const { return generation_; }
+    const std::vector<int32_t>& sortedControlledTokens() const { return sorted_controlled_tokens_; }
+    const std::vector<int32_t>& eosCandidates() const { return eos_candidates_; }
+    // Immutable until reload; reload must not run concurrently with generation.
+    const std::vector<int32_t>& sortedCandidates(const std::string& key) const {
+        const auto it = sorted_candidates_.find(key);
+        return it == sorted_candidates_.end() || it->second.empty() ? eos_candidates_ : it->second;
+    }
+
     bool isControlledToken(int32_t token) const {
         return controlled_tokens_.count(token) != 0;
     }
@@ -480,12 +502,17 @@ private:
         init_success_ = false;
         prefix_to_cadicates_.clear();
         controlled_tokens_.clear();
+        sorted_candidates_.clear();
+        sorted_controlled_tokens_.clear();
+        eos_candidates_.clear();
+        ++generation_;
         config = TreeDecodeConfig{};
 
         // Try optimized streaming parser first for large files
         bool schema_error = false;
         if (loadPrefixDictStreaming(file_path, schema_error)) {
             buildControlledTokens();
+            buildSortedCandidates();
             init_success_ = true;
             RTP_LLM_LOG_INFO("PrefixToCandidateTokens load [%s] successfully (streaming): "
                              "allow_unlisted_tokens=%s, controlled_token_count=%zu",
@@ -533,12 +560,30 @@ private:
         }
         file.close();
         buildControlledTokens();
+        buildSortedCandidates();
         init_success_ = true;
         RTP_LLM_LOG_INFO("PrefixToCandidateTokens load [%s] successfully: "
                          "allow_unlisted_tokens=%s, controlled_token_count=%zu",
                          file_path.c_str(),
                          config.allow_unlisted_tokens ? "true" : "false",
                          controlled_tokens_.size());
+    }
+
+    void buildSortedCandidates() {
+        RTP_LLM_LOG_INFO("tree_decode_gpu_sparse_mask=%s, allow_unlisted_tokens=%s",
+                         config.tree_decode_gpu_sparse_mask ? "true" : "false",
+                         config.allow_unlisted_tokens ? "true" : "false");
+        if (!config.allow_unlisted_tokens || !config.tree_decode_gpu_sparse_mask) {
+            return;
+        }
+        eos_candidates_ = {config.end_token_id};
+        sorted_controlled_tokens_.assign(controlled_tokens_.begin(), controlled_tokens_.end());
+        std::sort(sorted_controlled_tokens_.begin(), sorted_controlled_tokens_.end());
+        for (const auto& entry : prefix_to_cadicates_) {
+            auto& ids = sorted_candidates_[entry.first];
+            ids.assign(entry.second.begin(), entry.second.end());
+            std::sort(ids.begin(), ids.end());
+        }
     }
 
     // Validate only the opt-in mode: old dictionaries retain their acceptance rules.
@@ -637,6 +682,10 @@ private:
     TreeDecodeConfig                                             config;
     std::unordered_map<std::string, std::unordered_set<int32_t>> prefix_to_cadicates_;
     std::unordered_set<int32_t>                                  controlled_tokens_;
+    uint64_t generation_ = 0;
+    std::vector<int32_t> sorted_controlled_tokens_;
+    std::vector<int32_t> eos_candidates_;
+    std::unordered_map<std::string, std::vector<int32_t>> sorted_candidates_;
     bool                                                         init_success_ = false;
 };
 

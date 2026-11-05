@@ -478,4 +478,40 @@ TEST_F(PrefixToCandidateTokensTest, AllowUnlistedTokensAcceptsExplicitEndStateAn
     EXPECT_EQ((std::unordered_set<int32_t>{1, 2}), inst->controlledTokens());
 }
 
+TEST_F(PrefixToCandidateTokensTest, SparseSwitchCachesSortedCandidatesAndInvalidatesOnReload) {
+    const std::string json = R"({"allow_unlisted_tokens":true,"tree_decode_gpu_sparse_mask":true,
+        "start_token_id":1,"end_token_id":0,"prefix_dict":{"1":[20,10,10],"1_10":[],"1_20":[0]}})";
+    writeJsonFile(tmp_path_, json);
+    auto inst = PrefixToCandidateTokens::instance();
+    inst->reloadPrefixDict(tmp_path_);
+    ASSERT_TRUE(inst->initSuccess());
+    EXPECT_TRUE(inst->gpuSparseMask());
+    EXPECT_EQ((std::vector<int32_t>{0, 10, 20}), inst->sortedControlledTokens());
+    EXPECT_EQ((std::vector<int32_t>{10, 20}), inst->sortedCandidates("1"));
+    EXPECT_EQ((std::vector<int32_t>{0}), inst->sortedCandidates("1_10"));
+    EXPECT_EQ((std::vector<int32_t>{0}), inst->sortedCandidates("missing"));
+    TreeDecodeConfig legacy;
+    autil::legacy::FromJsonString(legacy, json);
+    EXPECT_TRUE(legacy.tree_decode_gpu_sparse_mask);
+    const auto generation = inst->generation();
+    writeJsonFile(tmp_path_, R"({"start_token_id":1,"prefix_dict":{"1":[3]}})");
+    inst->reloadPrefixDict(tmp_path_);
+    EXPECT_GT(inst->generation(), generation);
+    EXPECT_FALSE(inst->gpuSparseMask());
+    EXPECT_TRUE(inst->sortedControlledTokens().empty());
+    EXPECT_TRUE(inst->sortedCandidates("1").empty());
+}
+
+TEST_F(PrefixToCandidateTokensTest, SparseSwitchRejectsNonBooleanTypesInBothParsers) {
+    for (const std::string value : {"1", "null", "\"true\"", "[]", "{}", "0.5"}) {
+        const auto json = "{\"tree_decode_gpu_sparse_mask\":" + value + ",\"prefix_dict\":{}}";
+        writeJsonFile(tmp_path_, json);
+        auto inst = PrefixToCandidateTokens::instance();
+        inst->reloadPrefixDict(tmp_path_);
+        EXPECT_FALSE(inst->initSuccess()) << value;
+        TreeDecodeConfig legacy;
+        EXPECT_THROW(autil::legacy::FromJsonString(legacy, json), autil::legacy::ExceptionBase) << value;
+    }
+}
+
 }  // namespace rtp_llm

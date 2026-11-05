@@ -25,6 +25,12 @@ void invokeMaskLogits(T*             logits_batch,
 // word encodes 32 tokens (bit=1 allowed); row_indices maps compact mask rows to
 // rows in logits_batch. A null row_indices pointer means identity mapping.
 #if USING_CUDA
+// Sparse controlled domain. CSR offsets are int64; inactive rows have row_id=-1.
+template<typename T>
+void invokeTreeSparseMask(T* logits, const int32_t* controlled, int64_t controlled_count,
+                          const int32_t* candidates, const int64_t* offsets, const int32_t* rows,
+                          int64_t row_count, int64_t row_stride, cudaStream_t stream);
+
 template<typename T>
 void invokePackedMaskLogits(T*             logits_batch,
                             const int32_t* packed_allow_mask,

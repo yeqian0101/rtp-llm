@@ -1,5 +1,9 @@
 #include "rtp_llm/cpp/models/logits_processor/TreeLogitsProcessor.h"
 
+#if USING_CUDA
+#include "rtp_llm/models_py/bindings/cuda/ops/StandaloneOps.h"
+#endif
+
 using namespace std;
 
 namespace rtp_llm {
@@ -10,6 +14,54 @@ std::optional<ErrorInfo>
 TreeLogitsProcessor::process(const SamplerInputs& inputs, size_t start_idx, size_t finish_idx) {
     auto batch_size = size();
     RTP_LLM_CHECK(batch_size == finish_idx - start_idx);
+    const auto prefix = PrefixToCandidateTokens::instance();
+    if (prefix->gpuSparseMask()) {
+#if USING_CUDA
+        if (prefix->allowUnlistedTokens() && inputs.logits.is_cuda()) {
+            if (std::none_of(tree_infos_.begin(), tree_infos_.end(),
+                             [](const StreamTreeInfo& info) { return info.in_tree_mode; })) {
+                return std::nullopt;
+            }
+            if (!prefix->initSuccess()) {
+                return ErrorInfo(ErrorCode::INVALID_PARAMS, "tree decode dictionary is not initialized");
+            }
+            if (inputs.logits.dim() != 2 || inputs.logits.stride(1) != 1
+                || inputs.logits.stride(0) < inputs.logits.size(1)
+                || finish_idx > static_cast<size_t>(inputs.logits.size(0))
+                || batch_size > static_cast<size_t>(std::numeric_limits<int32_t>::max())) {
+                return ErrorInfo(ErrorCode::INVALID_PARAMS, "unsupported tree sparse logits layout");
+            }
+            const auto dtype = inputs.logits.scalar_type();
+            if (dtype != torch::kFloat32 && dtype != torch::kFloat16 && dtype != torch::kBFloat16) {
+                return ErrorInfo(ErrorCode::INVALID_PARAMS, "unsupported tree sparse logits dtype");
+            }
+            const auto& controlled = prefix->sortedControlledTokens();
+            // Sorted extrema validate the entire controlled domain in O(1).
+            // Every effective candidate belongs to this domain, including EOS.
+            if (controlled.empty() || controlled.front() < 0 || controlled.back() >= inputs.logits.size(1)) {
+                return ErrorInfo(ErrorCode::INVALID_PARAMS, "tree decode controlled token is outside the vocabulary");
+            }
+            std::vector<const std::vector<int32_t>*> candidates(batch_size, nullptr);
+            bool active = false;
+            for (size_t i = 0; i < batch_size; ++i) {
+                if (tree_infos_[i].in_tree_mode) {
+                    candidates[i] = &tree_infos_[i].dfa_ptr->getSortedCandidateTokenIds();
+                    active = true;
+                }
+            }
+            if (active) {
+                auto logits = inputs.logits.narrow(0, start_idx, batch_size);
+                cudaTreeSparseMask(logits, prefix->generation(), controlled, candidates, sparse_state_);
+            }
+            return std::nullopt;
+        }
+#endif
+        if (fallback_generation_ != prefix->generation()) {
+            RTP_LLM_LOG_INFO("tree decode backend=dense, gpu sparse requested but requires "
+                             "allow_unlisted_tokens=true and CUDA logits/backend");
+            fallback_generation_ = prefix->generation();
+        }
+    }
     bool                             need_process = false;
     std::vector<std::vector<size_t>> batch_candidate_token_ids(batch_size);
 
@@ -32,7 +84,6 @@ TreeLogitsProcessor::process(const SamplerInputs& inputs, size_t start_idx, size
     auto   batch_logits     = inputs.logits.narrow(0, start_idx, batch_size);
     size_t vocab_size       = batch_logits.size(1);
     torch::Tensor batch_vocab_mask;
-    const auto prefix = PrefixToCandidateTokens::instance();
     if (prefix->allowUnlistedTokens()) {
         // Validate before indexing; an out-of-vocabulary controlled token is a
         // configuration error, not permission to fall back to unconstrained decoding.

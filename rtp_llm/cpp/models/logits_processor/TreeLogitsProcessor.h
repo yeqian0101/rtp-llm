@@ -5,6 +5,8 @@
 
 namespace rtp_llm {
 
+struct TreeSparseMaskState;
+
 struct StreamTreeInfo {
     bool                                       in_tree_mode;
     int32_t                                    input_length;
@@ -63,6 +65,8 @@ public:
 
 private:
     std::vector<StreamTreeInfo> tree_infos_;
+    std::shared_ptr<TreeSparseMaskState> sparse_state_;
+    uint64_t fallback_generation_ = 0;
 };
 typedef std::shared_ptr<TreeLogitsProcessor> TreeLogitsProcessorPtr;
 
